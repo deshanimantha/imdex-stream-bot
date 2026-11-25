@@ -3,14 +3,14 @@ import re
 import asyncio
 import traceback
 from urllib.parse import quote
-import aiohttp
 from aiohttp import web
-from pyrogram import Client, filters, raw
+from pyrogram import Client, filters
 
 API_ID = int(os.environ.get("API_ID", "0").strip())
 API_HASH = os.environ.get("API_HASH", "").strip()
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 BIN_CHANNEL = int(os.environ.get("BIN_CHANNEL", "0").strip())
+ACCESS_HASH = int(os.environ.get("ACCESS_HASH", "0").strip() or "0")
 FQDN = os.environ.get("FQDN", "").strip().rstrip("/")
 PORT = int(os.environ.get("PORT", "8080").strip())
 
@@ -24,7 +24,7 @@ bot = Client(
     in_memory=True,
 )
 
-# Server Wake-up වූ විට Private Channel එකේ access_hash ස්වයංක්‍රීයව ලබාගැනීම
+# Server Wake-up වූ විට Private Channel එක මතකයට ලබාගැනීම
 async def ensure_channel_cached():
     try:
         await bot.get_chat(BIN_CHANNEL)
@@ -32,34 +32,15 @@ async def ensure_channel_cached():
     except Exception:
         pass
 
-    api_base = f"https://api.telegram.org/bot{BOT_TOKEN}"
-    async with aiohttp.ClientSession() as session:
-        async with session.get(f"{api_base}/getChat", params={"chat_id": BIN_CHANNEL}) as resp:
-            data = await resp.json()
-            if not data.get("ok"):
-                raise RuntimeError(
-                    f"Channel Access Error: {data.get('description')} "
-                    f"(Bot ව Private Channel එකේ Admin කර ඇත්දැයි බලන්න)"
-                )
-            invite_link = data["result"].get("invite_link")
+    if ACCESS_HASH:
+        await bot.storage.update_peers([(BIN_CHANNEL, ACCESS_HASH, "channel", None, None)])
+        await bot.get_chat(BIN_CHANNEL)
+        return
 
-        if not invite_link:
-            async with session.post(f"{api_base}/exportChatInviteLink", json={"chat_id": BIN_CHANNEL}) as resp:
-                inv_data = await resp.json()
-                invite_link = inv_data.get("result")
-
-    if invite_link:
-        match = re.search(r"(?:joinchat/|\+)([\w-]+)", invite_link)
-        if match:
-            r = await bot.invoke(raw.functions.messages.CheckChatInvite(hash=match.group(1)))
-            if isinstance(r, raw.types.ChatInviteAlready) and hasattr(r.chat, "access_hash"):
-                await bot.invoke(
-                    raw.functions.channels.GetChannels(
-                        id=[raw.types.InputChannel(channel_id=r.chat.id, access_hash=r.chat.access_hash)]
-                    )
-                )
-
-    await bot.get_chat(BIN_CHANNEL)
+    raise RuntimeError(
+        "Channel not cached yet. Telegram Bot ට ඔබේ Private Channel එකෙන් ෆයිල් එකක් Forward කර "
+        "ලැබෙන ACCESS_HASH අංකය Render Environment Variables වලට එකතු කරන්න."
+    )
 
 def get_media_info(msg):
     media = msg.document or msg.video or msg.audio
@@ -84,8 +65,6 @@ async def start_cmd(client, message):
 async def handle_file(client, message):
     status_msg = await message.reply_text("⏳ Direct Link එක සකසමින් පවතී...", quote=True)
     try:
-        await ensure_channel_cached()
-
         if (
             message.forward_from_chat
             and message.forward_from_chat.id == BIN_CHANNEL
@@ -93,18 +72,31 @@ async def handle_file(client, message):
         ):
             msg_id = message.forward_from_message_id
         else:
+            await ensure_channel_cached()
             copied = await message.copy(BIN_CHANNEL)
             msg_id = copied.id
+
+        peer = await client.resolve_peer(BIN_CHANNEL)
+        ch_hash = getattr(peer, "access_hash", 0)
 
         file_name, _, _ = get_media_info(message)
         safe_name = quote(file_name)
         base_url = FQDN if FQDN else "https://imdex-stream-bot.onrender.com"
         direct_link = f"{base_url}/dl/{msg_id}/{safe_name}"
 
+        hash_note = ""
+        if not ACCESS_HASH and ch_hash:
+            hash_note = (
+                f"\n\n🔑 **Render සඳහා `ACCESS_HASH` (එක් වරක් පමණක් Save කරන්න):**\n"
+                f"`{ch_hash}`\n"
+                f"*(Server එක Sleep වී ආපසු Wake වෙද්දී Error නොඑන්න, ඉහත අංකය Render Environment Variables වල `ACCESS_HASH` ලෙස Save කරන්න)*"
+            )
+
         await status_msg.edit_text(
             f"✅ **Direct Download Link Ready!**\n\n"
             f"📁 **File:** `{file_name}`\n\n"
             f"🔗 **Direct Link:**\n`{direct_link}`"
+            f"{hash_note}"
         )
     except Exception as e:
         await status_msg.edit_text(f"❌ **Error:**\n`{e}`")
@@ -196,7 +188,7 @@ async def main():
         await ensure_channel_cached()
         print("BIN_CHANNEL cached successfully.")
     except Exception as e:
-        print(f"Warning caching BIN_CHANNEL: {e}")
+        print(f"Info: {e}")
 
     app = web.Application()
     app.router.add_get("/", home_handler)
